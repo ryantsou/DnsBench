@@ -2,7 +2,7 @@
 
 ################################################################################
 # DNS Benchmark Script
-# 
+#
 # Description:
 #   This script tests the response time of popular public DNS servers by
 #   performing DNS lookups and measuring latency. It then ranks the servers
@@ -17,11 +17,19 @@
 ################################################################################
 
 # Color codes for output formatting
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+if [ -t 1 ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
 
 # Array of DNS servers to test
 # Format: "Name|IP"
@@ -36,11 +44,21 @@ declare -a DNS_SERVERS=(
     "Quad9 Secondary|149.112.112.112"
 )
 
-# Test domain for DNS lookups
-TEST_DOMAIN="google.com"
+# Default test domains for DNS lookups
+declare -a DEFAULT_TEST_DOMAINS=(
+    "google.com"
+    "cloudflare.com"
+    "github.com"
+    "microsoft.com"
+)
 
-# Number of pings per DNS server
-PING_COUNT=5
+declare -a TEST_DOMAINS=("${DEFAULT_TEST_DOMAINS[@]}")
+
+# Number of queries per domain and DNS server
+QUERY_COUNT=5
+
+# Timeout passed to dig, in seconds
+TIMEOUT=2
 
 ################################################################################
 # Function: check_dependencies
@@ -48,9 +66,9 @@ PING_COUNT=5
 ################################################################################
 check_dependencies() {
     local missing_deps=()
-    
-    for cmd in dig ping bc; do
-        if ! command -v $cmd &> /dev/null; then
+
+    for cmd in dig awk sort; do
+        if ! command -v "$cmd" &> /dev/null; then
             missing_deps+=("$cmd")
         fi
     done
@@ -58,6 +76,103 @@ check_dependencies() {
     if [ ${#missing_deps[@]} -ne 0 ]; then
         echo -e "${RED}Error: Missing required dependencies: ${missing_deps[*]}${NC}"
         echo "Please install them before running this script."
+        exit 1
+    fi
+}
+
+################################################################################
+# Function: usage
+# Description: Prints the command line usage
+################################################################################
+usage() {
+    cat <<EOF
+Usage: $0 [-d domains] [-n count] [-t timeout] [-h]
+
+Options:
+  -d domains   Comma-separated list of domains to test.
+  -n count     Queries per domain and DNS server (default: $QUERY_COUNT).
+  -t timeout   dig timeout in seconds (default: $TIMEOUT).
+  -h           Show this help message.
+
+Examples:
+  $0
+  $0 -d google.com,cloudflare.com,github.com -n 7 -t 3
+EOF
+}
+
+################################################################################
+# Function: parse_args
+# Description: Reads CLI overrides for domains and benchmark settings
+################################################################################
+parse_args() {
+    local custom_domains=()
+    local raw_domains=()
+    local domain
+
+    while getopts ":d:n:t:h" opt; do
+        case "$opt" in
+            d)
+                IFS=',' read -r -a raw_domains <<< "$OPTARG"
+                for domain in "${raw_domains[@]}"; do
+                    domain="${domain//[[:space:]]/}"
+                    if [ -n "$domain" ]; then
+                        custom_domains+=("$domain")
+                    fi
+                done
+                ;;
+            n)
+                QUERY_COUNT="$OPTARG"
+                ;;
+            t)
+                TIMEOUT="$OPTARG"
+                ;;
+            h)
+                usage
+                exit 0
+                ;;
+            :)
+                echo -e "${RED}Error: Option -$OPTARG requires an argument.${NC}"
+                usage
+                exit 1
+                ;;
+            \?)
+                echo -e "${RED}Error: Unknown option -$OPTARG.${NC}"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    shift $((OPTIND - 1))
+
+    if [ $# -gt 0 ]; then
+        echo -e "${RED}Error: unexpected positional arguments: $*.${NC}"
+        usage
+        exit 1
+    fi
+
+    if [ ${#custom_domains[@]} -gt 0 ]; then
+        TEST_DOMAINS=("${custom_domains[@]}")
+    fi
+}
+
+################################################################################
+# Function: validate_inputs
+# Description: Validates benchmark parameters
+################################################################################
+validate_inputs() {
+    if ! [[ "$QUERY_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}Error: query count must be a positive integer.${NC}"
+        exit 1
+    fi
+
+    if ! [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}Error: timeout must be a positive integer.${NC}"
+        exit 1
+    fi
+
+    if [ ${#TEST_DOMAINS[@]} -eq 0 ]; then
+        echo -e "${RED}Error: at least one test domain is required.${NC}"
         exit 1
     fi
 }
@@ -73,25 +188,37 @@ test_dns_server() {
     local dns_ip=$1
     local total_time=0
     local successful_queries=0
-    
-    for i in $(seq 1 $PING_COUNT); do
-        # Perform DNS lookup and measure time
-        local query_time=$(dig @${dns_ip} ${TEST_DOMAIN} +timeout=2 +tries=1 | \
-            grep "Query time:" | \
-            awk '{print $4}')
-        
-        if [ -n "$query_time" ] && [ "$query_time" != "0" ]; then
-            total_time=$(echo "$total_time + $query_time" | bc)
-            ((successful_queries++))
-        fi
+    local min_time=""
+    local max_time=""
+    local domain
+    local i
+    local query_time
+
+    for domain in "${TEST_DOMAINS[@]}"; do
+        for ((i = 1; i <= QUERY_COUNT; i++)); do
+            query_time=$(dig @"${dns_ip}" "$domain" +timeout="$TIMEOUT" +tries=1 +stats 2>&1 | awk '/Query time:/ {print $4; exit}')
+
+            if [[ "$query_time" =~ ^[0-9]+$ ]]; then
+                total_time=$((total_time + query_time))
+                ((successful_queries++))
+
+                if [ -z "$min_time" ] || [ "$query_time" -lt "$min_time" ]; then
+                    min_time="$query_time"
+                fi
+
+                if [ -z "$max_time" ] || [ "$query_time" -gt "$max_time" ]; then
+                    max_time="$query_time"
+                fi
+            fi
+        done
     done
-    
+
     if [ $successful_queries -eq 0 ]; then
         echo "timeout"
     else
-        # Calculate average
-        local avg_time=$(echo "scale=2; $total_time / $successful_queries" | bc)
-        echo "$avg_time"
+        local avg_time
+        avg_time=$(awk -v total="$total_time" -v count="$successful_queries" 'BEGIN { printf "%.2f", total / count }')
+        echo "$avg_time|$successful_queries|$min_time|$max_time"
     fi
 }
 
@@ -114,6 +241,9 @@ format_time() {
 # Main Script
 ################################################################################
 
+parse_args "$@"
+validate_inputs
+
 echo -e "${BLUE}=====================================${NC}"
 echo -e "${BLUE}   DNS Server Benchmark Tool${NC}"
 echo -e "${BLUE}=====================================${NC}"
@@ -122,14 +252,13 @@ echo ""
 # Check dependencies
 check_dependencies
 
-echo -e "Testing domain: ${YELLOW}${TEST_DOMAIN}${NC}"
-echo -e "Queries per server: ${YELLOW}${PING_COUNT}${NC}"
+echo -e "Testing domains: ${YELLOW}${TEST_DOMAINS[*]}${NC}"
+echo -e "Queries per domain and server: ${YELLOW}${QUERY_COUNT}${NC}"
+echo -e "Timeout: ${YELLOW}${TIMEOUT}s${NC}"
 echo ""
 echo -e "${BLUE}Benchmarking DNS servers...${NC}"
 echo ""
 
-# Store results
-declare -A results
 declare -a valid_servers
 
 # Test each DNS server
@@ -139,15 +268,12 @@ for server_info in "${DNS_SERVERS[@]}"; do
     echo -n "Testing $name ($ip)... "
     
     avg_time=$(test_dns_server "$ip")
-    results["$name|$ip"]="$avg_time"
-    
-    # Display result
-    formatted_time=$(format_time "$avg_time")
-    echo -e "$formatted_time"
-    
-    # Store valid servers for ranking
-    if [ "$avg_time" != "timeout" ]; then
-        valid_servers+=("$name|$ip|$avg_time")
+    if [ "$avg_time" = "timeout" ]; then
+        echo -e "${RED}TIMEOUT${NC}"
+    else
+        IFS='|' read -r avg_value success_count min_value max_value <<< "$avg_time"
+        valid_servers+=("$name|$ip|$avg_value|$success_count|$min_value|$max_value")
+        echo -e "$(format_time "$avg_value") (${success_count}/${#TEST_DOMAINS[@]} domains x $QUERY_COUNT queries, ${min_value}-${max_value} ms)"
     fi
 done
 
@@ -163,17 +289,15 @@ if [ ${#valid_servers[@]} -eq 0 ]; then
     exit 1
 fi
 
-# Sort servers by response time
-IFS=$'\n' sorted_servers=($(sort -t'|' -k3 -n <<< "${valid_servers[*]}"))
-unset IFS
+mapfile -t sorted_servers < <(printf '%s\n' "${valid_servers[@]}" | sort -t'|' -k3,3n)
 
 echo -e "${YELLOW}Ranked DNS Servers (fastest to slowest):${NC}"
 echo ""
 
 rank=1
 for server_data in "${sorted_servers[@]}"; do
-    IFS='|' read -r name ip time <<< "$server_data"
-    echo -e "${rank}. $name ($ip): ${GREEN}${time} ms${NC}"
+    IFS='|' read -r name ip time success_count min_time max_time <<< "$server_data"
+    echo -e "${rank}. $name ($ip): ${GREEN}${time} ms${NC} (${success_count}/${#TEST_DOMAINS[@]} domains x $QUERY_COUNT, ${min_time}-${max_time} ms)"
     ((rank++))
 done
 
@@ -181,13 +305,16 @@ echo ""
 echo -e "${BLUE}=====================================${NC}"
 
 # Recommend the fastest server
-IFS='|' read -r best_name best_ip best_time <<< "${sorted_servers[0]}"
+IFS='|' read -r best_name best_ip best_time best_success_count best_min_time best_max_time <<< "${sorted_servers[0]}"
 echo -e "${GREEN}✓ Recommended DNS Server:${NC}"
 echo -e "  ${YELLOW}${best_name}${NC} (${best_ip})"
 echo -e "  Average response time: ${GREEN}${best_time} ms${NC}"
+echo -e "  Observations: ${best_success_count}/${#TEST_DOMAINS[@]} domains x $QUERY_COUNT queries, ${best_min_time}-${best_max_time} ms"
 echo ""
 echo -e "${BLUE}=====================================${NC}"
 echo ""
 echo -e "To use this DNS server, configure your network settings with:"
 echo -e "  Primary DNS: ${YELLOW}${best_ip}${NC}"
+echo ""
+echo -e "Note: this benchmarks resolver latency from this machine. Validate again on the target network before changing production DNS."
 echo ""
